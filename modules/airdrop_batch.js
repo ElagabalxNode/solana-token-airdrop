@@ -25,20 +25,6 @@ function writeCSV(filePath, data) {
   fs.writeFileSync(filePath, output);
 }
 
-function appendToCSV(filePath, data) {
-  // Проверяем существует ли файл
-  let existingData = [];
-  if (fs.existsSync(filePath)) {
-    existingData = readCSV(filePath);
-  }
-  
-  // Добавляем новые данные
-  existingData.push(data);
-  
-  // Записываем обновленный файл
-  writeCSV(filePath, existingData);
-}
-
 async function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -61,10 +47,11 @@ async function createTransferInstructions(connection, senderPublicKey, tokenPubl
       toWallet
     );
 
-    await sleep(1000 / RPC_REQUESTS_PER_SECOND);
+    await sleep(1000 / RPC_REQUESTS_PER_SECOND); // Ожидание для соблюдения лимита RPC запросов
     const toAccountInfo = await connection.getAccountInfo(toTokenAccount);
 
     if (!toAccountInfo) {
+      // Если токен-аккаунт не существует, добавляем инструкцию на его создание
       instructions.push(
         splToken.createAssociatedTokenAccountInstruction(
           senderPublicKey,
@@ -75,6 +62,7 @@ async function createTransferInstructions(connection, senderPublicKey, tokenPubl
       );
     }
 
+    // Добавляем инструкцию на перевод токенов
     instructions.push(
       splToken.createTransferInstruction(
         fromTokenAccount,
@@ -83,35 +71,22 @@ async function createTransferInstructions(connection, senderPublicKey, tokenPubl
         amount
       )
     );
-
-    return { instructions, signers, success: true };
   } catch (error) {
-    console.error(`Error creating instructions for recipient ${recipient.address}: ${error.message}`);
-    return { instructions: [], signers: [], success: false, error: error.message };
+    console.error(`Error processing recipient ${recipient.address}: ${error.message}`);
   }
+
+  return { instructions, signers };
 }
 
-async function executeTransaction(connection, transaction, senderKeypair, recipient) {
+async function executeTransaction(connection, transaction, senderKeypair, batch, recipient) {
   let retries = 0;
   let delay = INITIAL_BACKOFF;
 
   while (retries < MAX_RETRIES) {
     try {
-      await sleep(1000 / SEND_TRANSACTION_PER_SECOND);
+      await sleep(1000 / SEND_TRANSACTION_PER_SECOND); // Ожидание для соблюдения лимита отправки транзакций
       const signature = await web3.sendAndConfirmTransaction(connection, transaction, [senderKeypair]);
-      
-      // Записываем успешный результат
-      const result = {
-        timestamp: new Date().toISOString(),
-        address: recipient.address,
-        amount: recipient.amount,
-        status: 'success',
-        signature: signature,
-        error: null
-      };
-      appendToCSV(config.outputCsvPath, result);
-      
-      console.log(`Transfer completed. Recipient: ${recipient.address}, Amount: ${recipient.amount}, Signature: ${signature}`);
+      console.log(`Batch ${batch} completed. Signature: ${signature}`);
       return { success: true, signature };
     } catch (error) {
       if (error.message.includes('429 Too Many Requests')) {
@@ -120,32 +95,10 @@ async function executeTransaction(connection, transaction, senderKeypair, recipi
         delay = Math.min(delay * 2, MAX_BACKOFF);
         retries++;
       } else {
-        // Записываем неудачный результат
-        const result = {
-          timestamp: new Date().toISOString(),
-          address: recipient.address,
-          amount: recipient.amount,
-          status: 'failed',
-          signature: null,
-          error: error.message
-        };
-        appendToCSV(config.outputCsvPath, result);
-        
         return { success: false, error: error.message };
       }
     }
   }
-
-  // Записываем результат после превышения лимита попыток
-  const result = {
-    timestamp: new Date().toISOString(),
-    address: recipient.address,
-    amount: recipient.amount,
-    status: 'failed',
-    signature: null,
-    error: 'Max retries exceeded'
-  };
-  appendToCSV(config.outputCsvPath, result);
 
   return { success: false, error: 'Max retries exceeded' };
 }
@@ -157,94 +110,114 @@ async function performBatchAirdrop() {
   );
   const tokenPublicKey = new web3.PublicKey(config.tokenAddress);
   const airdropList = readCSV(config.inputCsvPath);
-
-  // Создаем файл результатов, если он не существует
-  if (!fs.existsSync(config.outputCsvPath)) {
-    writeCSV(config.outputCsvPath, []);
-  }
+  const results = [];
 
   const MAX_TRANSACTION_SIZE = 1232;
   const ESTIMATED_INSTRUCTION_SIZE = 100;
   let transaction = new web3.Transaction();
   let transactionSize = 0;
-  let currentRecipients = [];
+  let currentBatch = 1;
+  let currentBatchRecipients = []; // Временное хранение получателей в текущем batch
 
   for (let i = 0; i < airdropList.length; i++) {
     const recipient = airdropList[i];
-    console.log(`Processing recipient ${i + 1}/${airdropList.length}: ${recipient.address}`);
 
     try {
-      const { instructions, signers, success, error } = await createTransferInstructions(
-        connection, 
-        senderKeypair.publicKey, 
-        tokenPublicKey, 
-        recipient
-      );
+      const { instructions } = await createTransferInstructions(connection, senderKeypair.publicKey, tokenPublicKey, recipient);
+      
+      const modifyComputeUnits = ComputeBudgetProgram.setComputeUnitLimit({
+        units: 2000000
+      });
+      const addPriorityFee = ComputeBudgetProgram.setComputeUnitPrice({
+        microLamports: 100_000
+      });
 
-      if (!success) {
-        console.error(`Failed to create instructions for ${recipient.address}: ${error}`);
-        continue;
-      }
-
-      // Увеличение вычислительного лимита и приоритета транзакции
       if (transactionSize === 0) {
-        const modifyComputeUnits = ComputeBudgetProgram.setComputeUnitLimit({
-          units: 2000000
-        });
-        const addPriorityFee = ComputeBudgetProgram.setComputeUnitPrice({
-          microLamports: 100_000
-        });
         transaction.add(modifyComputeUnits).add(addPriorityFee);
         transactionSize += ESTIMATED_INSTRUCTION_SIZE * 2;
       }
 
-      // Проверяем, не превысит ли добавление новых инструкций максимальный размер транзакции
-      const newInstructionsSize = instructions.length * ESTIMATED_INSTRUCTION_SIZE;
-      if (transactionSize + newInstructionsSize > MAX_TRANSACTION_SIZE) {
-        // Отправляем текущую транзакцию
-        await executeTransaction(connection, transaction, senderKeypair, recipient);
-
-        // Начинаем новую транзакцию
-        transaction = new web3.Transaction();
-        const modifyComputeUnits = ComputeBudgetProgram.setComputeUnitLimit({
-          units: 2000000
-        });
-        const addPriorityFee = ComputeBudgetProgram.setComputeUnitPrice({
-          microLamports: 100_000
-        });
-        transaction.add(modifyComputeUnits).add(addPriorityFee);
-        transactionSize = ESTIMATED_INSTRUCTION_SIZE * 2;
-        currentRecipients = [];
-      }
-
-      // Добавляем инструкции в транзакцию
       for (const instruction of instructions) {
+        if (transactionSize + ESTIMATED_INSTRUCTION_SIZE > MAX_TRANSACTION_SIZE) {
+          // Отправляем транзакцию
+          const result = await sendTransaction(transaction, connection, senderKeypair, currentBatch, recipient);
+          
+          // Записываем результаты для каждого получателя в текущем batch
+          for (const batchRecipient of currentBatchRecipients) {
+            results.push({
+              address: batchRecipient.address,
+              amount: batchRecipient.amount,
+              status: result.success ? 'success' : 'failed',
+              signature: result.success ? result.signature : null,
+              error: result.success ? null : result.error,
+              batch: currentBatch
+            });
+          }
+
+          // Обновляем CSV после каждой транзакции
+          writeCSV(config.outputCsvPath, results);
+
+          // Сбрасываем batch
+          transaction = new web3.Transaction().add(modifyComputeUnits).add(addPriorityFee);
+          transactionSize = ESTIMATED_INSTRUCTION_SIZE * 2;
+          currentBatch++;
+          currentBatchRecipients = [];
+        }
+        
         transaction.add(instruction);
+        transactionSize += ESTIMATED_INSTRUCTION_SIZE;
       }
-      transactionSize += newInstructionsSize;
-      currentRecipients.push(recipient);
+      
+      currentBatchRecipients.push(recipient);
 
     } catch (error) {
-      console.error(`Error processing recipient ${recipient.address}: ${error.message}`);
-      // Записываем ошибку в CSV
-      const result = {
-        timestamp: new Date().toISOString(),
+      // Записываем ошибку для текущего получателя
+      results.push({
         address: recipient.address,
         amount: recipient.amount,
         status: 'failed',
         signature: null,
-        error: error.message
-      };
-      appendToCSV(config.outputCsvPath, result);
+        error: error.message,
+        batch: currentBatch
+      });
+
+      writeCSV(config.outputCsvPath, results);
     }
   }
 
   // Отправляем последнюю транзакцию, если она не пустая
-  if (transactionSize > ESTIMATED_INSTRUCTION_SIZE * 2) {
-    await executeTransaction(connection, transaction, senderKeypair, currentRecipients[currentRecipients.length - 1]);
+  if (transactionSize > 0 && currentBatchRecipients.length > 0) {
+    const result = await sendTransaction(transaction, connection, senderKeypair, currentBatch, currentBatchRecipients[currentBatchRecipients.length - 1]);
+    
+    // Записываем результаты для всех получателей в последнем batch
+    for (const batchRecipient of currentBatchRecipients) {
+      results.push({
+        address: batchRecipient.address,
+        amount: batchRecipient.amount,
+        status: result.success ? 'success' : 'failed',
+        signature: result.success ? result.signature : null,
+        error: result.success ? null : result.error,
+        batch: currentBatch
+      });
+    }
+
+    writeCSV(config.outputCsvPath, results);
   }
 
   console.log(`Airdrop completed! Results written to ${config.outputCsvPath}`);
+}
+
+async function sendTransaction(transaction, connection, senderKeypair, batch, recipient) {
+  const result = await executeTransaction(connection, transaction, senderKeypair, batch, recipient);
+  
+  if (!result.success) {
+    console.error(`Batch ${batch} failed: ${result.error}`);
+  }
+  
+  // Задержка для ограничения скорости отправки транзакций
+  await sleep(1000 / SEND_TRANSACTION_PER_SECOND);
+  
+  return result;
 }
 
 async function checkTokenBalance(connection, walletPublicKey, tokenPublicKey) {
@@ -252,7 +225,7 @@ async function checkTokenBalance(connection, walletPublicKey, tokenPublicKey) {
   console.log(`Token address: ${tokenPublicKey.toString()}`);
 
   try {
-    await sleep(1000 / RPC_REQUESTS_PER_SECOND);
+    await sleep(1000 / RPC_REQUESTS_PER_SECOND); // Ожидание для соблюдения лимита RPC запросов
     const tokenAccounts = await connection.getTokenAccountsByOwner(walletPublicKey, { mint: tokenPublicKey });
 
     if (tokenAccounts.value.length === 0) {
@@ -291,6 +264,14 @@ async function main() {
 
   console.log("Checking sender's token balance after airdrop:");
   await checkTokenBalance(connection, senderKeypair.publicKey, tokenPublicKey);
+
+  // Проверка баланса нескольких случайных получателей
+  const recipients = readCSV(config.inputCsvPath);
+  for (let i = 0; i < 5; i++) {
+    const randomRecipient = recipients[Math.floor(Math.random() * recipients.length)];
+    console.log(`Checking token balance of random recipient ${i + 1}:`);
+    await checkTokenBalance(connection, new web3.PublicKey(randomRecipient.address), tokenPublicKey);
+  }
 }
 
 main().catch(console.error);
