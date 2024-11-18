@@ -1,0 +1,8 @@
+{
+  "rpcUrl": "https://api.mainnet-beta.solana.com",
+  "tokenAddress": "YOUR_TOKEN_ADDRESS",
+  "tokenDecimals": 8,
+  "senderWalletPath": "sender_wallet.json",
+  "inputCsvPath": "airdrop_list.csv",
+  "outputCsvPath": "airdrop_results.csv"
+}
